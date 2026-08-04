@@ -20,5 +20,9 @@ strip = true     # Strip symbols
 
 [patch.crates-io]
 rusty-s3 = { git = "https://github.com/dtkav/rusty-s3", branch = "main" }
-yrs = { git = "https://github.com/dtkav/y-crdt", rev = "4adcaa62a251bfde5f0ae9b11148413d78d60cd0" }
 yrs-kvstore = { path = "yrs-kvstore" }
+# Vendored yrs carries two patches not yet on crates.io:
+# 1. find_pivot divide-by-zero on single one-unit-block client streams (our fix,
+#    PR: https://github.com/y-crdt/y-crdt/pull/645)
+# 2. delete-set-loss when updates arrive out of causal order (dtkav/y-crdt@4adcaa6)
+yrs = { path = "vendor/yrs-0.26.0" }
