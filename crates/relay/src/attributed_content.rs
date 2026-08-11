@@ -27,7 +27,7 @@ pub struct AttributedContent {
 }
 
 /// Reverse the PUD "users" map (user -> {ids: [client_id]}) into client -> user.
-fn user_by_client<T: ReadTxn>(txn: &T) -> HashMap<u64, String> {
+pub fn user_by_client<T: ReadTxn>(txn: &T) -> HashMap<u64, String> {
     let mut result = HashMap::new();
     let Some(users_map) = txn.get_map("users") else {
         return result;
@@ -238,10 +238,9 @@ mod tests {
     }
 
     /// A client whose whole stream is one single-unit block used to panic
-    /// yrs 0.26's find_pivot (clock / 0) when splitting at the current
-    /// snapshot; our vendored patch (crates/vendor/yrs-0.26.0) fixes that,
-    /// so this now attributes correctly instead of hitting the catch_unwind
-    /// fallback.
+    /// yrs 0.26's find_index (clock / 0) when splitting at the current
+    /// snapshot. Our patched yrs branch fixes that, so this attributes
+    /// correctly rather than hitting the catch_unwind fallback.
     #[test]
     fn test_single_unit_stream_attributes_correctly() {
         let doc = Doc::new();
