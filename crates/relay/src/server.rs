@@ -1,4 +1,6 @@
 use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
+use crate::edit_author;
+use crate::vpath_index::VPathIndex;
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -22,7 +24,12 @@ use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
@@ -58,6 +65,11 @@ const PING_EVERY: Duration = Duration::from_secs(20);
 /// would-be keepalive reap. Observe-only: the connection is never closed for
 /// this; the metric exists to measure whether enforcement would be safe.
 const PONG_TIMEOUT: Duration = Duration::from_secs(40);
+
+/// How often to re-warn while a connection's outbound channel stays full. The
+/// full/recovered transition warns cover the common case; this distinguishes a
+/// client that is wedged for hours from one that stalled briefly.
+const CHANNEL_FULL_REWARN: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
 pub struct AllowedHost {
@@ -132,6 +144,7 @@ fn validate_file_token(
                     "access_wrong_document",
                 ));
             }
+            server_state.check_user_denied(file_permission.user.as_deref())?;
         }
         _ => {
             return Err(AppError::auth(
@@ -238,6 +251,29 @@ pub struct Server {
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     metrics: Arc<RelayMetrics>,
+    /// User ids refused doc/file access at token verification. Tokens
+    /// without a user claim (server tokens) are never affected.
+    denied_users: HashSet<String>,
+    /// When non-empty, doc websocket connections from user-claimed tokens
+    /// must report one of these plugin versions (the `v` query param).
+    allowed_client_versions: HashSet<String>,
+    /// Blocked clients retry connecting continuously, so denial warns are
+    /// throttled to one line per user per DENIAL_LOG_INTERVAL. Only denied
+    /// user ids ever enter the map, so it stays small.
+    denial_log_throttle: Mutex<HashMap<String, DenialLogState>>,
+    /// Resolves the doc GUIDs carried by log lines to the vpaths their shared
+    /// folder lists them under.
+    vpath_index: Arc<VPathIndex>,
+    /// Relay user id -> display name, for log readability. Empty unless
+    /// configured; a missing id logs `name=<none>`.
+    user_names: Arc<HashMap<String, String>>,
+}
+
+const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(300);
+
+struct DenialLogState {
+    last_logged: Instant,
+    suppressed: u64,
 }
 
 impl Server {
@@ -308,7 +344,149 @@ impl Server {
             event_dispatcher,
             sync_protocol_event_sender,
             metrics,
+            denied_users: HashSet::new(),
+            allowed_client_versions: HashSet::new(),
+            denial_log_throttle: Mutex::new(HashMap::new()),
+            vpath_index: Arc::new(VPathIndex::default()),
+            user_names: Arc::new(HashMap::new()),
         })
+    }
+
+    pub fn with_allowed_client_versions(
+        mut self,
+        versions: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.allowed_client_versions = versions.into_iter().collect();
+        if !self.allowed_client_versions.is_empty() {
+            tracing::warn!(
+                "Requiring client version in {:?} for doc websocket access",
+                self.allowed_client_versions
+            );
+        }
+        self
+    }
+
+    pub fn with_user_names(
+        mut self,
+        names: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        let names: HashMap<String, String> = names.into_iter().collect();
+        if !names.is_empty() {
+            tracing::info!("Loaded display names for {} user id(s)", names.len());
+        }
+        self.user_names = Arc::new(names);
+        self
+    }
+
+    pub fn with_denied_users(mut self, users: impl IntoIterator<Item = String>) -> Self {
+        self.denied_users = users.into_iter().collect();
+        if !self.denied_users.is_empty() {
+            tracing::warn!(
+                "Denying doc/file access to {} user id(s): {:?}",
+                self.denied_users.len(),
+                self.denied_users
+            );
+        }
+        self
+    }
+
+    /// Some(suppressed_count) when this user's denial should be logged now;
+    /// None when it falls inside the throttle window (the count accrues for
+    /// the next logged line).
+    fn denial_log_permit(&self, user: &str) -> Option<u64> {
+        let mut throttle = self.denial_log_throttle.lock().unwrap();
+        match throttle.get_mut(user) {
+            Some(state) if state.last_logged.elapsed() < DENIAL_LOG_INTERVAL => {
+                state.suppressed += 1;
+                None
+            }
+            Some(state) => {
+                let suppressed = state.suppressed;
+                state.last_logged = Instant::now();
+                state.suppressed = 0;
+                Some(suppressed)
+            }
+            None => {
+                throttle.insert(
+                    user.to_string(),
+                    DenialLogState {
+                        last_logged: Instant::now(),
+                        suppressed: 0,
+                    },
+                );
+                Some(0)
+            }
+        }
+    }
+
+    /// 403 unless the client reported a version in allowed_client_versions.
+    /// Empty list disables the gate. Connections without a user claim
+    /// (server tokens) always pass - they are servers, not plugins.
+    fn check_client_version(
+        &self,
+        user: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<(), AppError> {
+        let Some(user) = user else {
+            return Ok(());
+        };
+        if self.allowed_client_versions.is_empty() {
+            return Ok(());
+        }
+
+        match version {
+            Some(v) if self.allowed_client_versions.contains(v) => Ok(()),
+            _ => {
+                if let Some(suppressed) = self.denial_log_permit(user) {
+                    tracing::warn!(
+                        user = %user,
+                        // Old builds report nothing at all, and "which of these
+                        // is version-less" drives who needs a manual upgrade.
+                        version = %version.unwrap_or("none"),
+                        allowed = %self
+                            .allowed_client_versions
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        suppressed,
+                        interval_secs = DENIAL_LOG_INTERVAL.as_secs(),
+                        "Blocked user on client version"
+                    );
+                }
+                Err(AppError::auth(
+                    StatusCode::FORBIDDEN,
+                    anyhow!("This plugin version is temporarily blocked from sync; run witchdoctor to upgrade"),
+                    "client_version_blocked",
+                ))
+            }
+        }
+    }
+
+    /// 403 if the token's user claim is on the denylist. `None` (server
+    /// tokens, or no authenticator) always passes.
+    fn check_user_denied(&self, user: Option<&str>) -> Result<(), AppError> {
+        if let Some(user) = user {
+            if self.denied_users.contains(user) {
+                if let Some(suppressed) = self.denial_log_permit(user) {
+                    tracing::warn!(
+                        "Denied user {} refused access ({} more denials suppressed in the last {}s)",
+                        user,
+                        suppressed,
+                        DENIAL_LOG_INTERVAL.as_secs()
+                    );
+                }
+                return Err(AppError::auth(
+                    StatusCode::FORBIDDEN,
+                    anyhow!(
+                        "This account is temporarily blocked from sync; contact your administrator"
+                    ),
+                    "user_denied",
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Close every doc WebSocket: each socket loop breaks, sends its
@@ -385,7 +563,7 @@ impl Server {
     pub async fn create_doc(&self) -> Result<String> {
         let doc_id = nanoid::nanoid!();
         self.load_doc(&doc_id, None).await?;
-        tracing::info!(doc_id=?doc_id, "Created doc");
+        tracing::info!(doc_id = %doc_id, "Created doc");
         Ok(doc_id)
     }
 
@@ -462,6 +640,8 @@ impl Server {
             let routing_channel_for_callback = routing_channel_name.clone();
             let user_for_callback = user.clone();
             let registry = self.registry.clone();
+            let vpath_index = self.vpath_index.clone();
+            let user_names = self.user_names.clone();
             let doc_id_for_callback = doc_id.to_string();
             // The parent pin lives in this closure, which the doc owns via
             // its SyncKv observer: the guard detaches when the doc drops.
@@ -486,18 +666,116 @@ impl Server {
                         }
                     }
 
-                    // Log the full event payload as JSON after user assignment
-                    match serde_json::to_string(&event) {
-                        Ok(json_str) => {
-                            tracing::info!("Document updated event dispatched: {}", json_str);
-                        }
-                        Err(e) => {
+                    // Adds, removes and renames arrive as ordinary updates to
+                    // the folder doc's filemeta map, so only a diff of that map
+                    // says which happened. The diff consumes the cached
+                    // mapping that resolve() would otherwise read, hence the
+                    // split: folder edits report membership, child edits
+                    // resolve their own path.
+                    //
+                    // Both values come off the event, not the closure: the
+                    // callback is built once when the doc loads and reused for
+                    // every later update, so its captured doc_id and channel
+                    // describe that first load rather than the edit in hand.
+                    let edited_doc_id = event.doc_id.as_str();
+                    let channel = event
+                        .metadata
+                        .get("channel")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(&routing_channel_for_callback);
+
+                    let editing_folder_doc = channel == edited_doc_id;
+                    let folder = if editing_folder_doc {
+                        None
+                    } else {
+                        registry.peek(channel)
+                    };
+
+                    if editing_folder_doc {
+                        if let Some(delta) = event
+                            .state
+                            .as_deref()
+                            .and_then(|state| {
+                                vpath_index.sync_membership_from_snapshot(channel, state)
+                            })
+                        {
+                            // Same resolution as "Doc edited": event.user is the
+                            // folder doc's first-load identity, not whoever made
+                            // this change.
+                            let by = match (&event.update, &event.state) {
+                                (Some(update), Some(state)) => {
+                                    edit_author::user_from_snapshot(state, update)
+                                }
+                                _ => None,
+                            };
+                            let by = by.as_deref().or(event.user.as_deref());
+
                             tracing::info!(
-                                "Document updated event dispatched for doc_id: {} (JSON serialization failed: {})",
-                                event.doc_id, e
+                                added = %delta.added.join(","),
+                                removed = %delta.removed.join(","),
+                                moved = %delta
+                                    .moved
+                                    .iter()
+                                    .map(|(from, to)| format!("{from}->{to}"))
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                name = %by
+                                    .and_then(|id| user_names.get(id))
+                                    .map(String::as_str)
+                                    .unwrap_or("<none>"),
+                                user = %by.unwrap_or("-"),
+                                // One id per device+session, so a file that
+                                // comes back after a delete can be traced to
+                                // the client that republished it.
+                                clients = %event
+                                    .update
+                                    .as_deref()
+                                    .map(edit_author::clients_for_update)
+                                    .unwrap_or_else(|| "-".to_string()),
+                                channel = %channel,
+                                "Folder membership changed"
                             );
                         }
                     }
+
+                    // `vpath` is the note's path within its shared folder; it is
+                    // "-" when the folder doc is not resident or does not list
+                    // this child, which is why doc_id stays on the line.
+                    let vpath = folder
+                        .and_then(|folder| vpath_index.resolve(channel, &folder, edited_doc_id));
+
+                    // event.user is the callback's captured identity, which
+                    // describes whichever connection first loaded the doc.
+                    // Resolving the update's own client ids against the doc's
+                    // PUD map names the person who actually made this edit.
+                    // Read from the snapshot, not the live doc, for the same
+                    // lock reason as the membership diff.
+                    let author = match (&event.update, &event.state) {
+                        (Some(update), Some(state)) => {
+                            edit_author::user_from_snapshot(state, update)
+                        }
+                        _ => None,
+                    };
+
+                    // The only per-user record of content change. Doc opens and
+                    // evictions are debug; this is what an operator reads to answer
+                    // "who changed something, and was it a keystroke or a rewrite".
+                    // Field order is for a human reading a terminal: the two
+                    // ids are 73 characters each and would push everything
+                    // legible off the right edge.
+                    let user_id = author.as_deref().or(event.user.as_deref());
+                    tracing::info!(
+                        vpath = %vpath.as_deref().unwrap_or("-"),
+                        name = %user_id
+                            .and_then(|id| user_names.get(id))
+                            .map(String::as_str)
+                            .unwrap_or("<none>"),
+                        user = %user_id.unwrap_or("-"),
+                        update_bytes = event.update.as_ref().map_or(0, Vec::len),
+                        doc_id = %edited_doc_id,
+                        channel = %channel,
+                        "Doc edited"
+                    );
 
                     // Step 1: Create the envelope with predetermined routing channel
                     let envelope = EventEnvelope::new(routing_channel_for_callback.clone(), event);
@@ -522,6 +800,27 @@ impl Server {
             event_callback,
         )
         .await?;
+
+        // First receipt of a brand-new doc: nothing in the store held state
+        // for this id. Logged with the authenticated user so surprise
+        // identities (e.g. republished deletions) are attributable from
+        // server logs alone.
+        if dwskv.sync_kv().created() {
+            // No vpath: the parent folder learns the new guid in a separate
+            // update that has not necessarily arrived yet, so the path is only
+            // knowable once it does.
+            tracing::info!(
+                name = %user
+                    .as_deref()
+                    .and_then(|id| self.user_names.get(id))
+                    .map(String::as_str)
+                    .unwrap_or("<none>"),
+                user = %user.as_deref().unwrap_or("-"),
+                doc_id = %doc_id,
+                channel = %routing_channel_name,
+                "New doc created: first receipt of this id"
+            );
+        }
 
         // If channel is provided in token, store it in document metadata
         if let Some(channel_name) = routing_channel {
@@ -642,7 +941,12 @@ impl Server {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
                 async move {
-                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    tracing::debug!(
+                        doc_id = %doc_id,
+                        channel = %routing_channel.as_deref().unwrap_or("-"),
+                        user = %user.as_deref().unwrap_or("-"),
+                        "Loading doc"
+                    );
                     self.build_doc(doc_id, routing_channel, user).await
                 }
             })
@@ -666,7 +970,12 @@ impl Server {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
                 async move {
-                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    tracing::debug!(
+                        doc_id = %doc_id,
+                        channel = %routing_channel.as_deref().unwrap_or("-"),
+                        user = %user.as_deref().unwrap_or("-"),
+                        "Loading doc"
+                    );
                     self.build_doc(doc_id, routing_channel, user).await
                 }
             })
@@ -750,6 +1059,10 @@ impl Server {
             .route("/doc/:doc_id/as-update", get(get_doc_as_update_deprecated))
             .route("/doc/:doc_id/update", post(update_doc_deprecated))
             .route("/d/:doc_id/as-update", get(get_doc_as_update))
+            .route(
+                "/d/:doc_id/attributed-content",
+                get(get_doc_attributed_content),
+            )
             .route("/d/:doc_id/update", post(update_doc))
             .route("/d/:doc_id/versions", get(handle_doc_versions))
             .route(
@@ -884,6 +1197,9 @@ impl Server {
 #[derive(Deserialize)]
 struct HandlerParams {
     token: Option<String>,
+    /// Plugin version, reported by clients >= 0.8.8-th.6. Absent on older
+    /// clients - which is exactly what allowed_client_versions gates on.
+    v: Option<String>,
 }
 
 async fn get_doc_as_update(
@@ -912,6 +1228,42 @@ async fn get_doc_as_update_deprecated(
 ) -> Result<Response, AppError> {
     tracing::warn!("/doc/:doc_id/as-update is deprecated; call /doc/:doc_id/auth instead and then call as-update on the returned base URL.");
     get_doc_as_update(State(server_state), Path(doc_id), auth_header).await
+}
+
+#[derive(Deserialize)]
+struct AttributedContentParams {
+    root: Option<String>,
+}
+
+async fn get_doc_attributed_content(
+    State(server_state): State<Arc<Server>>,
+    Path(doc_id): Path<String>,
+    Query(params): Query<AttributedContentParams>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+) -> Result<Response, AppError> {
+    let token = get_token_from_header(auth_header);
+    let _ = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+
+    let guard = server_state
+        .attach_doc(&doc_id, AttachKind::Http, None, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let root = params.root.as_deref().unwrap_or("contents");
+    let awareness = guard.awareness();
+    let awareness = awareness.read().unwrap();
+    match crate::attributed_content::attributed_content(awareness.doc(), root) {
+        Some(content) => Ok(Json(json!({
+            "doc_id": doc_id,
+            "root": content.root,
+            "spans": content.spans,
+        }))
+        .into_response()),
+        None => Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            anyhow!("doc has no text root named {root}"),
+        )),
+    }
 }
 
 async fn update_doc_deprecated(
@@ -991,10 +1343,23 @@ async fn handle_socket_upgrade_with_channel_and_user(
     };
 
     let user_for_pud = user.clone();
+    let channel_for_vpath = routing_channel.clone();
     let guard = server_state
         .attach_doc(&doc_id, AttachKind::Socket, routing_channel, user)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Resolved once per connection rather than per deletion: attach_doc has
+    // loaded and pinned the parent folder by now, and a doc does not change
+    // path mid-socket often enough to justify re-resolving on every update.
+    let vpath = channel_for_vpath.as_deref().and_then(|channel| {
+        server_state.registry.peek(channel).and_then(|folder| {
+            server_state.vpath_index.resolve(channel, &folder, &doc_id)
+        })
+    });
+    let user_name = user_for_pud
+        .as_deref()
+        .and_then(|id| server_state.user_names.get(id))
+        .cloned();
     // Socket loops watch the doc-close token (a child of the server token)
     // so shutdown can close them ahead of the graceful drain.
     let cancellation_token = server_state.doc_close_token.clone();
@@ -1014,6 +1379,8 @@ async fn handle_socket_upgrade_with_channel_and_user(
             cancellation_token,
             sync_protocol_event_sender,
             doc_id_clone,
+            vpath,
+            user_name,
             metrics,
         )
     }))
@@ -1074,6 +1441,8 @@ fn verify_socket_token(
         }
     };
 
+    server_state.check_user_denied(user.as_deref())?;
+
     Ok((authorization, channel, user))
 }
 
@@ -1088,6 +1457,7 @@ async fn handle_socket_upgrade_deprecated(
     );
     let (authorization, channel, user) =
         verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
+    server_state.check_client_version(user.as_deref(), params.v.as_deref())?;
 
     handle_socket_upgrade_with_channel_and_user(
         ws,
@@ -1119,6 +1489,7 @@ async fn handle_socket_upgrade_full_path(
 
     let (authorization, channel, user) =
         verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
+    server_state.check_client_version(user.as_deref(), params.v.as_deref())?;
 
     handle_socket_upgrade_with_channel_and_user(
         ws,
@@ -1141,6 +1512,8 @@ async fn handle_socket(
     cancellation_token: CancellationToken,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
+    vpath: Option<String>,
+    user_name: Option<String>,
     metrics: Arc<RelayMetrics>,
 ) {
     let (sink, stream) = socket.split();
@@ -1154,6 +1527,8 @@ async fn handle_socket(
         cancellation_token,
         sync_protocol_event_sender,
         doc_id,
+        vpath,
+        user_name,
         metrics,
     )
     .await
@@ -1172,6 +1547,8 @@ async fn handle_socket_inner<S, T, E>(
     cancellation_token: CancellationToken,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
+    vpath: Option<String>,
+    user_name: Option<String>,
     metrics: Arc<RelayMetrics>,
 ) where
     S: Sink<Message> + Send + Unpin + 'static,
@@ -1181,6 +1558,8 @@ async fn handle_socket_inner<S, T, E>(
     let awareness = guard.awareness();
     let sync_kv = guard.sync_kv();
     let (send, mut recv) = channel(1024);
+    let connected_at = std::time::Instant::now();
+    tracing::debug!(doc_id = %doc_id, user = %user.as_deref().unwrap_or("-"), "WebSocket connected");
 
     // Cancelled when the writer task exits (sink write failure) or when the
     // parent server token cancels. The read loop selects on it so the
@@ -1202,52 +1581,88 @@ async fn handle_socket_inner<S, T, E>(
     let metrics_clone = metrics.clone();
     let callback_doc_id = doc_id.clone();
     let callback_user = user.clone();
+    // "-" rather than None so every line in this handler reads the same whether
+    // or not the socket carried an identity.
+    let log_user = user.clone().unwrap_or_else(|| "-".to_string());
     // A wedged client can stay full for hours; per-message warns have produced
     // millions of identical, contextless lines in one incident. Log the
-    // full/recovered transitions with identity, count drops in between.
+    // full/recovered transitions with identity, count drops in between, and
+    // re-warn periodically so a long wedge stays visible.
     let channel_full = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let dropped_while_full = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let full_since_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_warn_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut conn = DocConnection::new_with_expiration(
         awareness,
         authorization,
         expiration_time,
-        move |bytes| {
-            match send_clone.try_send(Message::Binary(bytes.to_vec())) {
-                Ok(()) => {
-                    if channel_full.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                        tracing::info!(
-                            doc_id = %callback_doc_id,
-                            user = ?callback_user,
-                            dropped = dropped_while_full
-                                .swap(0, std::sync::atomic::Ordering::Relaxed),
-                            "Outbound channel recovered; messages were dropped while full"
-                        );
-                    }
+        move |bytes| match send_clone.try_send(Message::Binary(bytes.to_vec())) {
+            Ok(()) => {
+                if channel_full.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        doc_id = %callback_doc_id,
+                        user = ?callback_user,
+                        dropped = dropped_while_full
+                            .swap(0, std::sync::atomic::Ordering::Relaxed),
+                        full_secs = (connected_at.elapsed().as_millis() as u64)
+                            .saturating_sub(
+                                full_since_ms.load(std::sync::atomic::Ordering::Relaxed),
+                            )
+                            / 1000,
+                        "Outbound channel recovered; messages were dropped while full"
+                    );
                 }
-                Err(TrySendError::Closed(_)) => {
-                    // The writer task has exited; the read loop tears the
-                    // connection down as soon as it sees the cancelled token,
-                    // so this is a brief race, not an error.
-                    metrics_clone.record_websocket_send_failure("closed");
-                    tracing::debug!("Dropping outbound message: writer task exited");
-                }
-                Err(TrySendError::Full(_)) => {
-                    // A dropped update silently desyncs this client until it
-                    // reconnects; the metric tracks how often that happens.
-                    metrics_clone.record_websocket_send_failure("full");
-                    dropped_while_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if !channel_full.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        tracing::warn!(
-                            doc_id = %callback_doc_id,
-                            user = ?callback_user,
-                            "Outbound channel full; dropping messages until it recovers"
-                        );
-                    }
+            }
+            Err(TrySendError::Closed(_)) => {
+                // The writer task has exited; the read loop tears the
+                // connection down as soon as it sees the cancelled token,
+                // so this is a brief race, not an error.
+                metrics_clone.record_websocket_send_failure("closed");
+                tracing::debug!("Dropping outbound message: writer task exited");
+            }
+            Err(TrySendError::Full(_)) => {
+                // A dropped update silently desyncs this client until it
+                // reconnects; the metric tracks how often that happens.
+                metrics_clone.record_websocket_send_failure("full");
+                let dropped =
+                    dropped_while_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let now_ms = connected_at.elapsed().as_millis() as u64;
+                if !channel_full.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    full_since_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                    last_warn_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        doc_id = %callback_doc_id,
+                        user = ?callback_user,
+                        "Outbound channel full; dropping messages until it recovers"
+                    );
+                } else if now_ms
+                    .saturating_sub(last_warn_ms.load(std::sync::atomic::Ordering::Relaxed))
+                    >= CHANNEL_FULL_REWARN.as_millis() as u64
+                {
+                    last_warn_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        doc_id = %callback_doc_id,
+                        user = ?callback_user,
+                        dropped,
+                        full_secs = now_ms
+                            .saturating_sub(
+                                full_since_ms.load(std::sync::atomic::Ordering::Relaxed),
+                            )
+                            / 1000,
+                        "Outbound channel still full; dropping messages"
+                    );
                 }
             }
         },
     );
     conn.set_sync_kv(sync_kv);
+    conn.set_doc_id(doc_id.clone());
+    if let Some(vpath) = vpath {
+        conn.set_vpath(vpath);
+    }
+    if let Some(user_name) = user_name {
+        conn.set_user_name(user_name);
+    }
     if let Some(user) = user {
         conn.set_user(user);
     }
@@ -1298,7 +1713,12 @@ async fn handle_socket_inner<S, T, E>(
                         continue;
                     }
                     msg => {
-                        tracing::warn!(?msg, "Received non-binary message");
+                        tracing::warn!(
+                            doc_id = %doc_id,
+                            user = %log_user,
+                            ?msg,
+                            "Received non-binary message"
+                        );
                         continue;
                     }
                 };
@@ -1323,15 +1743,23 @@ async fn handle_socket_inner<S, T, E>(
                         break "token_expired";
                     }
                     Err(e) => {
-                        tracing::warn!(?e, "Error handling message");
+                        tracing::warn!(
+                            doc_id = %doc_id,
+                            user = %log_user,
+                            ?e,
+                            "Error handling message"
+                        );
                     }
                 }
             }
             _ = ticker.tick() => {
                 if last_pong.elapsed() > PONG_TIMEOUT && !pong_timed_out {
                     pong_timed_out = true;
+                    // Nothing acts on this, and the long-lived folder-root
+                    // subscriptions miss pongs routinely. The metric is the
+                    // place to watch it from.
                     metrics.record_pong_timeout();
-                    tracing::info!(
+                    tracing::debug!(
                         doc_id = %doc_id,
                         "Pong timeout (observe-only): a keepalive reaper would close this connection"
                     );
@@ -1354,6 +1782,37 @@ async fn handle_socket_inner<S, T, E>(
             }
         }
     };
+
+    // Clients hold one socket per doc and cycle them on a fixed interval - a
+    // vault this size produces over a thousand closes an hour, clustered at the
+    // cycle length rather than spread out. None of it is actionable, so only a
+    // close reason the client did not choose stays at info.
+    //
+    // `stream_eof` is on that list despite reading as abnormal: Obsidian
+    // clients drop the socket without a close frame when a laptop sleeps or a
+    // note closes, so it is the ordinary way a client goes away. Measured
+    // 2026-08-10: 115 of them across 22 users in 23 minutes, 85% lasting five
+    // minutes or more - session churn, not faults, and 62% of all info volume.
+    // A single client cycling pathologically is still visible in
+    // `record_websocket_close` and by enabling this target for an hour.
+    let duration_secs = connected_at.elapsed().as_secs();
+    if close_reason == "close_frame" || close_reason == "stream_eof" {
+        tracing::debug!(
+            doc_id = %doc_id,
+            user = %log_user,
+            close_reason = %close_reason,
+            duration_secs,
+            "WebSocket disconnected"
+        );
+    } else {
+        tracing::info!(
+            doc_id = %doc_id,
+            user = %log_user,
+            close_reason = %close_reason,
+            duration_secs,
+            "WebSocket disconnected"
+        );
+    }
 
     metrics.record_websocket_close(close_reason);
 
@@ -1643,7 +2102,7 @@ async fn handle_file_upload_url(
     TypedHeader(host): TypedHeader<headers::Host>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileUploadUrlResponse>, AppError> {
-    tracing::info!(doc_id = %doc_id, "Generating file upload URL");
+    tracing::debug!(doc_id = %doc_id, "Generating file upload URL");
 
     // Get token and extract metadata
     let token = get_token_from_header(auth_header);
@@ -1767,7 +2226,7 @@ async fn handle_file_download_url(
     Query(params): Query<FileDownloadQueryParams>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileDownloadUrlResponse>, AppError> {
-    tracing::info!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
+    tracing::debug!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
 
     // Get token
     let token = get_token_from_header(auth_header);
@@ -2643,6 +3102,197 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_websocket_auth_denied_user() {
+        let mut authenticator = y_sweet_core::auth::Authenticator::gen_key().unwrap();
+        // CWT verification requires an expected audience (normally server.url).
+        authenticator.set_expected_audience(Some("https://test.example".to_string()));
+        let far_future = ExpirationTimeEpochMillis(4_102_444_800_000); // year 2100
+        let denied_token = authenticator
+            .gen_doc_token_cwt(
+                "test-doc",
+                Authorization::Full,
+                far_future,
+                Some("denied-user"),
+                None,
+            )
+            .unwrap();
+        let allowed_token = authenticator
+            .gen_doc_token_cwt(
+                "test-doc",
+                Authorization::Full,
+                far_future,
+                Some("allowed-user"),
+                None,
+            )
+            .unwrap();
+        let server_token = authenticator.server_token().unwrap();
+        let server_state = Arc::new(
+            Server::new(
+                None,
+                Duration::from_secs(60),
+                Some(authenticator),
+                None,
+                vec![],
+                CancellationToken::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap()
+            .with_denied_users(["denied-user".to_string()]),
+        );
+
+        let err = verify_socket_token(&server_state, "test-doc", Some(&denied_token)).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.auth_error_type, Some("user_denied"));
+
+        let (_, _, user) =
+            verify_socket_token(&server_state, "test-doc", Some(&allowed_token)).unwrap();
+        assert_eq!(user, Some("allowed-user".to_string()));
+
+        // Server tokens carry no user claim and must never be denied.
+        let (authorization, _, user) =
+            verify_socket_token(&server_state, "test-doc", Some(&server_token)).unwrap();
+        assert_eq!(authorization, Authorization::Full);
+        assert_eq!(user, None);
+    }
+
+    #[tokio::test]
+    async fn test_client_version_gate() {
+        let mut authenticator = y_sweet_core::auth::Authenticator::gen_key().unwrap();
+        authenticator.set_expected_audience(Some("https://test.example".to_string()));
+        let far_future = ExpirationTimeEpochMillis(4_102_444_800_000); // year 2100
+        let user_token = authenticator
+            .gen_doc_token_cwt(
+                "test-doc",
+                Authorization::Full,
+                far_future,
+                Some("someone"),
+                None,
+            )
+            .unwrap();
+        let server_token = authenticator.server_token().unwrap();
+        let server_state = Arc::new(
+            Server::new(
+                None,
+                Duration::from_secs(60),
+                Some(authenticator),
+                None,
+                vec![],
+                CancellationToken::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap()
+            .with_allowed_client_versions(["0.8.8-th.6".to_string()]),
+        );
+
+        let (_, _, user) =
+            verify_socket_token(&server_state, "test-doc", Some(&user_token)).unwrap();
+        assert_eq!(user, Some("someone".to_string()));
+
+        // Reporting an allowed version passes.
+        server_state
+            .check_client_version(user.as_deref(), Some("0.8.8-th.6"))
+            .unwrap();
+
+        // No version (an old client) is blocked.
+        let err = server_state
+            .check_client_version(user.as_deref(), None)
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.auth_error_type, Some("client_version_blocked"));
+
+        // A version not on the list is blocked.
+        let err = server_state
+            .check_client_version(user.as_deref(), Some("0.8.7"))
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        // Server tokens (no user claim) are exempt regardless of version.
+        let (_, _, no_user) =
+            verify_socket_token(&server_state, "test-doc", Some(&server_token)).unwrap();
+        assert_eq!(no_user, None);
+        server_state
+            .check_client_version(no_user.as_deref(), None)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_version_gate_disabled_when_empty() {
+        let server_state = Arc::new(
+            Server::new(
+                None,
+                Duration::from_secs(60),
+                None,
+                None,
+                vec![],
+                CancellationToken::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Empty list: everyone passes, version or not.
+        server_state
+            .check_client_version(Some("someone"), None)
+            .unwrap();
+        server_state
+            .check_client_version(Some("someone"), Some("0.8.7"))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_denial_log_throttle() {
+        let server_state = Server::new(
+            None,
+            Duration::from_secs(60),
+            None,
+            None,
+            vec![],
+            CancellationToken::new(),
+            true,
+            None,
+        )
+        .await
+        .unwrap()
+        .with_denied_users(["noisy-user".to_string()]);
+
+        // First denial logs (permit with 0 suppressed); repeats within the
+        // window accrue instead of logging.
+        assert_eq!(server_state.denial_log_permit("noisy-user"), Some(0));
+        assert_eq!(server_state.denial_log_permit("noisy-user"), None);
+        assert_eq!(server_state.denial_log_permit("noisy-user"), None);
+
+        // A different user has its own window.
+        assert_eq!(server_state.denial_log_permit("other-user"), Some(0));
+
+        // Expire noisy-user's window: the next permit reports the accrued
+        // count and resets it.
+        server_state
+            .denial_log_throttle
+            .lock()
+            .unwrap()
+            .get_mut("noisy-user")
+            .unwrap()
+            .last_logged = Instant::now() - DENIAL_LOG_INTERVAL;
+        assert_eq!(server_state.denial_log_permit("noisy-user"), Some(2));
+        assert_eq!(server_state.denial_log_permit("noisy-user"), None);
+
+        // The denial check itself still refuses every attempt, throttled or not.
+        for _ in 0..3 {
+            let err = server_state
+                .check_user_denied(Some("noisy-user"))
+                .unwrap_err();
+            assert_eq!(err.status, StatusCode::FORBIDDEN);
+            assert_eq!(err.auth_error_type, Some("user_denied"));
+        }
+    }
+
+    #[tokio::test]
     async fn test_websocket_auth_allows_missing_token_without_authenticator() {
         let server_state = Arc::new(
             Server::new(
@@ -3249,6 +3899,111 @@ mod test {
             );
         }
 
+        /// End-to-end shape of the vpath lookup: a child doc routed to a
+        /// parent channel whose filemeta_v0 lists it. Exercises the same
+        /// registry lookup the update callback performs, which unit tests on
+        /// VPathIndex alone cannot reach.
+        #[tokio::test]
+        async fn child_edit_resolves_its_vpath_through_the_registry() {
+            let store = MemoryStore::new();
+            let server = test_server(
+                Some(Box::new(store.clone())),
+                Duration::from_millis(10),
+                true,
+                CancellationToken::new(),
+            )
+            .await;
+
+            let parent_id = "parent-doc";
+            let child_guid = "child-doc";
+            server
+                .get_or_create_doc_with_channel(child_guid, Some(parent_id.to_string()))
+                .await
+                .unwrap();
+
+            let parent = server.registry.peek(parent_id).expect("parent resident");
+            {
+                use yrs::{Map as _, Transact as _};
+                let aw = parent.awareness();
+                let aw = aw.read().unwrap();
+                let map = aw.doc().get_or_insert_map("filemeta_v0");
+                let mut txn = aw.doc().transact_mut();
+                map.insert(
+                    &mut txn,
+                    "notes/child.md",
+                    yrs::Any::from(std::collections::HashMap::from([(
+                        "id".to_string(),
+                        yrs::Any::String(child_guid.into()),
+                    )])),
+                );
+            }
+
+            assert_eq!(
+                server.vpath_index.resolve(parent_id, &parent, child_guid),
+                Some("notes/child.md".to_string()),
+                "the callback resolves against the parent it peeks from the registry"
+            );
+        }
+
+        /// The production case the in-memory test misses: the parent folder
+        /// is loaded from the store on demand, so its filemeta_v0 arrives as
+        /// persisted state rather than an in-process insert.
+        #[tokio::test]
+        async fn vpath_resolves_when_the_parent_is_loaded_from_the_store() {
+            use yrs::{Map as _, Transact as _};
+            let store = MemoryStore::new();
+            let parent_id = "parent-doc";
+            let child_guid = "child-doc";
+
+            {
+                let server = test_server(
+                    Some(Box::new(store.clone())),
+                    Duration::from_millis(10),
+                    true,
+                    CancellationToken::new(),
+                )
+                .await;
+                let parent = server
+                    .get_or_create_doc(parent_id)
+                    .await
+                    .expect("parent loads");
+                {
+                    let aw = parent.awareness();
+                    let aw = aw.read().unwrap();
+                    let map = aw.doc().get_or_insert_map("filemeta_v0");
+                    let mut txn = aw.doc().transact_mut();
+                    map.insert(
+                        &mut txn,
+                        "notes/child.md",
+                        yrs::Any::from(std::collections::HashMap::from([(
+                            "id".to_string(),
+                            yrs::Any::String(child_guid.into()),
+                        )])),
+                    );
+                }
+                parent.sync_kv().persist().await.expect("persisted");
+            }
+
+            let server = test_server(
+                Some(Box::new(store.clone())),
+                Duration::from_millis(10),
+                true,
+                CancellationToken::new(),
+            )
+            .await;
+            server
+                .get_or_create_doc_with_channel(child_guid, Some(parent_id.to_string()))
+                .await
+                .unwrap();
+
+            let parent = server.registry.peek(parent_id).expect("parent resident");
+            assert_eq!(
+                server.vpath_index.resolve(parent_id, &parent, child_guid),
+                Some("notes/child.md".to_string()),
+                "a parent rehydrated from the store must still resolve its children"
+            );
+        }
+
         /// The subdoc→parent pin contract: a parent must stay resident
         /// while any of its subdocs is resident, and must become evictable
         /// once the last subdoc is gone (the pin must not leak).
@@ -3565,6 +4320,8 @@ mod test {
                 server_token,
                 Arc::new(SyncProtocolEventSender::new()),
                 "test_doc".to_string(),
+                None,
+                None,
                 metrics.clone(),
             ));
 

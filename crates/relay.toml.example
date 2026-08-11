@@ -6,6 +6,24 @@ url = "https://api.example.com"  # RELAY_SERVER_URL
 host = "0.0.0.0"                 # RELAY_SERVER_HOST
 port = 8080                      # PORT
 
+# Relay user ids refused doc/file access (403) at token verification.
+# Use to temporarily cut off clients (e.g. pending a plugin upgrade);
+# their local edits queue and sync normally once the id is removed.
+# denied_users = ["someuserid123xy"]
+
+# When non-empty, doc websocket clients must report one of these plugin
+# versions (v query param, sent by plugin >= 0.8.8-th.6); older clients
+# that report nothing are blocked. Server tokens are exempt.
+# allowed_client_versions = ["0.8.8-th.6"]
+
+# Display names for log readability only, never consulted for authorization.
+# Tokens carry an opaque user id and no name, so this is the server's only
+# source for one. Log lines carry both `name=` and `user=`; an id that is not
+# listed here logs `name=<none>`. Must come after every scalar key in [server],
+# since a TOML table would otherwise swallow them.
+# [server.user_names]
+# "someuserid123xy" = "Ada Lovelace"
+
 [metrics]
 port = 9090                      # METRICS_PORT
 

@@ -299,6 +299,27 @@ pub struct ServerConfig {
 
     #[serde(default = "default_redact_errors")]
     pub redact_errors: bool,
+
+    /// Relay user ids refused doc/file access at token verification.
+    /// A denied client sees the server as unreachable; its local edits
+    /// queue and sync normally once the id is removed. Server tokens
+    /// (no user claim) are never affected.
+    #[serde(default)]
+    pub denied_users: Vec<String>,
+
+    /// When non-empty, doc websocket connections must report one of these
+    /// plugin versions (`v` query param, sent by clients >= 0.8.8-th.6);
+    /// anything else - including clients too old to report - gets 403.
+    /// Server tokens are exempt. Empty = no version gating.
+    #[serde(default)]
+    pub allowed_client_versions: Vec<String>,
+
+    /// Relay user id -> display name, for log readability only. The server has
+    /// no other source for a name: tokens carry an opaque id and nothing else.
+    /// Ids absent from the map log `name=<none>`, and an empty map behaves the
+    /// same as not configuring one. Never consulted for authorization.
+    #[serde(default)]
+    pub user_names: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -590,6 +611,9 @@ impl Default for ServerConfig {
             checkpoint_freq_seconds: default_checkpoint_freq_seconds(),
             doc_gc: default_doc_gc(),
             redact_errors: default_redact_errors(),
+            denied_users: Vec::new(),
+            allowed_client_versions: Vec::new(),
+            user_names: HashMap::new(),
         }
     }
 }
@@ -1214,5 +1238,38 @@ public_key = "test-public-key"
         let (key, types) = parse_auth_env_value("abc123base64key==").unwrap();
         assert_eq!(key, "abc123base64key==");
         assert_eq!(types, default_allowed_token_types());
+    }
+
+    #[test]
+    fn user_names_parse_from_a_server_subtable() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+url = "https://example.com"
+
+[server.user_names]
+"abc123" = "Ada Lovelace"
+"#,
+        )
+        .expect("config with a user_names table must parse");
+
+        assert_eq!(
+            config.server.user_names.get("abc123").map(String::as_str),
+            Some("Ada Lovelace")
+        );
+        assert_eq!(config.server.user_names.get("nobody"), None);
+    }
+
+    #[test]
+    fn user_names_are_optional() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+url = "https://example.com"
+"#,
+        )
+        .expect("a config with no user_names must still parse");
+
+        assert!(config.server.user_names.is_empty());
     }
 }
